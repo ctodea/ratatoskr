@@ -1,10 +1,10 @@
 # systemd user unit: symlink into ~/.config/systemd/user/ (install.sh does it)
 [Unit]
-Description=Saga2 - Discord bridge to herdr agents
+Description=Ratatoskr - Discord bridge to herdr agents
 After=network-online.target
 
 [Service]
-ExecStart=%h/Work/saga2/.venv/bin/python %h/Work/saga2/saga2.py
+ExecStart=%h/Work/ratatoskr/.venv/bin/python %h/Work/ratatoskr/ratatoskr.py
 Restart=on-failure
 RestartSec=5
 

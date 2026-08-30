@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Saga2 - talk to the herdr agents on this machine from a private Discord server.
+"""Ratatoskr - talk to the herdr agents on this machine from a private Discord server.
+
+Named for the squirrel that runs up and down Yggdrasil relaying messages between
+the eagle at the crown and Nidhogg at the roots, which is the whole job here.
 
 One text channel per named herdr agent, created automatically when a new agent
 appears. A message typed into a channel is injected into that agent's pane via
 `herdr agent prompt`, so the pane at the computer shows the conversation live.
 Replies are NOT scraped from the terminal: herdr exposes each agent's Claude
 Code session id, and Claude Code writes a structured JSONL transcript per
-session - Saga2 tails that file and posts new turns to the channel. Turns typed
+session - Ratatoskr tails that file and posts new turns to the channel. Turns typed
 at the computer are mirrored too, so the channel holds the full history of the
 chat with that agent no matter where a message was written.
 """
@@ -23,9 +26,9 @@ from pathlib import Path
 
 import discord
 
-log = logging.getLogger("saga2")
+log = logging.getLogger("ratatoskr")
 
-CONFIG_PATH = Path.home() / ".config/saga2/config.toml"
+CONFIG_PATH = Path.home() / ".config/ratatoskr/config.toml"
 PROJECTS_DIR = Path.home() / ".claude/projects"
 DISCORD_LIMIT = 1900  # hard limit is 2000; leave room for prefixes
 
@@ -218,7 +221,7 @@ class AgentLink:
         return chunk[:keep].decode("utf-8", errors="replace").splitlines()
 
 
-class Saga2(discord.Client):
+class Ratatoskr(discord.Client):
     def __init__(self, cfg: dict):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -389,7 +392,7 @@ def main():
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
 
-    Saga2(cfg).run(cfg["discord"]["token"], log_handler=None)
+    Ratatoskr(cfg).run(cfg["discord"]["token"], log_handler=None)
 
 
 if __name__ == "__main__":

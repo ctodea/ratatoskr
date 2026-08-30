@@ -1,4 +1,4 @@
-# Copy to ~/.config/saga2/config.toml and fill in the three discord values.
+# Copy to ~/.config/ratatoskr/config.toml and fill in the three discord values.
 
 [discord]
 token = "BOT_TOKEN_FROM_DEVELOPER_PORTAL"
