@@ -1,0 +1,12 @@
+# systemd user unit: symlink into ~/.config/systemd/user/ (install.sh does it)
+[Unit]
+Description=Saga2 - Discord bridge to herdr agents
+After=network-online.target
+
+[Service]
+ExecStart=%h/Work/saga2/.venv/bin/python %h/Work/saga2/saga2.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
