@@ -16,6 +16,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 import tomllib
 from collections import deque
 from pathlib import Path
@@ -110,25 +111,86 @@ def turns_from_lines(lines: list[str]):
 class AgentLink:
     """One herdr agent wired to one Discord channel."""
 
+    # If an injected prompt's echo hasn't shown up in the tailed file after
+    # this long, we are tailing the wrong file (herdr's session id can be
+    # stale for resumed sessions) and go looking for the right one.
+    ECHO_DEADLINE = 15.0
+
     def __init__(self, name: str):
         self.name = name
         self.channel_id: int | None = None
-        self.session: str | None = None
+        self.herdr_session: str | None = None  # what herdr reports
+        self.session: str | None = None        # what we actually tail
         self.path: Path | None = None
         self.offset = 0
         # Prompts we injected from Discord, awaiting their transcript echo,
         # so they aren't posted back to the channel a second time.
         self.pending: deque[str] = deque(maxlen=20)
+        # (text, deadline) pairs driving the wrong-file detection above.
+        self.awaiting: list[tuple[str, float]] = []
 
     def attach(self, session: str, cwd: str):
         """Point at a (possibly new) Claude session. Tailing starts at the end
         of the file: history from before the wiring stays out of the channel."""
-        if session == self.session:
-            return
+        if session == self.herdr_session:
+            return  # herdr unchanged; keep whatever rebind() resolved
+        self.herdr_session = session
         self.session = session
-        self.path = transcript_path(session, cwd)
-        self.offset = self.path.stat().st_size if self.path.exists() else 0
-        log.info("%s -> session %s", self.name, session)
+        path = transcript_path(session, cwd)
+        if not path.exists():
+            # A /cd mid-session moves cwd but not the transcript directory.
+            hits = sorted(PROJECTS_DIR.glob(f"*/{session}.jsonl"))
+            if hits:
+                path = hits[0]
+        self.path = path
+        self.offset = path.stat().st_size if path.exists() else 0
+        log.info("%s -> session %s (%s)", self.name, session, path)
+
+    def note_injected(self, text: str):
+        self.pending.append(text)
+        self.awaiting.append((text, time.monotonic() + self.ECHO_DEADLINE))
+
+    def saw_echo(self, text: str):
+        self.awaiting = [(t, d) for t, d in self.awaiting if t != text]
+
+    def rebind_if_lost(self) -> bool:
+        """When an echo deadline expires, search recent transcripts for the
+        injected text and re-attach to the file that actually received it."""
+        now = time.monotonic()
+        expired = [t for t, d in self.awaiting if d < now]
+        if not expired:
+            return False
+        self.awaiting = [(t, d) for t, d in self.awaiting if d >= now]
+
+        recent = [
+            p for p in PROJECTS_DIR.glob("*/*.jsonl")
+            if p != self.path and now_mtime_within(p, 300)
+        ]
+        recent.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        for text in expired:
+            # The transcript stores the text JSON-encoded; match either form.
+            needles = [json.dumps(text)[1:-1].encode(), text.encode()]
+            for path in recent[:15]:
+                raw = tail_bytes(path, 512 * 1024)
+                pos = -1
+                for needle in needles:
+                    pos = raw.rfind(needle)
+                    if pos != -1:
+                        break
+                if pos == -1:
+                    continue
+                line_end = raw.find(b"\n", pos)
+                base = path.stat().st_size - len(raw)
+                self.path = path
+                self.session = path.stem
+                self.offset = base + (line_end + 1 if line_end != -1 else len(raw))
+                if text in self.pending:
+                    self.pending.remove(text)
+                log.warning("%s rebound to live transcript %s", self.name, path)
+                return True
+            log.warning("%s: injected prompt never surfaced in any transcript", self.name)
+        return False
 
     def read_new(self) -> list[str]:
         """Complete new lines since the last read. A partially-written line is
@@ -241,10 +303,11 @@ class Saga2(discord.Client):
             return
 
         text = message.content.strip()
-        link.pending.append(text)
+        link.note_injected(text)
         err = await asyncio.to_thread(herdr_prompt, link.name, text)
         if err:
             link.pending.remove(text)
+            link.saw_echo(text)
             await message.channel.send(f"⚠️ could not reach `{link.name}`: {err}")
 
     # -- herdr -> Discord --------------------------------------------------- #
@@ -261,7 +324,12 @@ class Saga2(discord.Client):
             await asyncio.sleep(interval)
 
     async def flush_link(self, link: AgentLink):
+        rebound = await asyncio.to_thread(link.rebind_if_lost)
         lines = await asyncio.to_thread(link.read_new)
+        if rebound and link.channel_id is not None:
+            ch = self.get_channel(link.channel_id)
+            if ch:
+                await ch.send("🔁 re-attached to this agent's live transcript")
         if not lines or link.channel_id is None:
             return
         channel = self.get_channel(link.channel_id)
@@ -270,9 +338,13 @@ class Saga2(discord.Client):
 
         for role, text in turns_from_lines(lines):
             if role == "user":
-                if text in link.pending:
-                    # Our own injected prompt echoing back - already on screen.
-                    link.pending.remove(text)
+                # Our own injected prompt echoing back - already on screen.
+                # Mid-turn injections arrive wrapped in harness text, so
+                # containment counts as a match too.
+                mine = next((p for p in link.pending if p == text or p in text), None)
+                if mine is not None:
+                    link.pending.remove(mine)
+                    link.saw_echo(mine)
                     continue
                 await send_chunked(channel, text, prefix="💻 ")
             else:
@@ -282,6 +354,23 @@ class Saga2(discord.Client):
 def channel_name(agent: str) -> str:
     """Discord channel names: lowercase, digits, dashes."""
     return "".join(c if c.isalnum() else "-" for c in agent.lower()).strip("-")
+
+
+def now_mtime_within(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime <= seconds
+    except OSError:
+        return False
+
+
+def tail_bytes(path: Path, limit: int) -> bytes:
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - limit))
+            return f.read()
+    except OSError:
+        return b""
 
 
 async def send_chunked(channel, text: str, prefix: str = ""):
