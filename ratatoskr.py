@@ -17,6 +17,7 @@ chat with that agent no matter where a message was written.
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -78,11 +79,37 @@ def transcript_path(session: str, cwd: str) -> Path:
 # --------------------------------------------------------------------------- #
 # transcript parsing
 
-def turns_from_lines(lines: list[str]):
-    """Yield ("user"|"assistant", text) from raw transcript JSONL lines.
+# Records Claude Code writes as "user" that the person never typed: the
+# compaction summary, injected reminders and command output.
+SYNTHETIC_USER_FLAGS = ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly", "isSidechain")
 
-    Only real conversation text survives: tool calls, tool results, thinking
-    blocks, attachments, and Claude Code's bookkeeping records are dropped.
+# An assistant message with one of these stop reasons is the turn's answer.
+# "tool_use" means the agent is still working: its text is a progress note
+# ("now I check X") that belongs in the terminal, not on the phone.
+FINAL_STOP_REASONS = ("end_turn", "stop_sequence", "max_tokens")
+
+PASTED_RE = re.compile(r"<pasted_content[^>]*>\n?(.*?)\n?</pasted_content[^>]*>", re.S)
+
+
+def user_text(raw: str) -> str | None:
+    """What the person actually typed, or None for harness-generated text.
+    Long prompts sent through herdr arrive wrapped in <pasted_content>."""
+    text = PASTED_RE.sub(lambda m: m.group(1), raw).strip()
+    # Slash-command echoes, system reminders, interrupt markers.
+    if not text or text.startswith(("<", "[Request interrupted")):
+        return None
+    return text
+
+
+def turns_from_lines(lines: list[str]):
+    """Yield ("user"|"assistant"|"working"|"done", text) from transcript lines.
+
+    - "user": a prompt the person typed.
+    - "assistant": text of the turn's final answer only.
+    - "working": the agent is mid-turn (tool calls, progress notes); text is
+      the dropped progress note, kept as a fallback answer.
+    - "done": the turn ended (Claude Code's turn_duration record).
+    Tool calls and results, thinking and bookkeeping never reach Discord.
     """
     for line in lines:
         try:
@@ -91,21 +118,38 @@ def turns_from_lines(lines: list[str]):
             continue
 
         kind = d.get("type")
+        if kind == "system" and d.get("subtype") == "turn_duration":
+            yield "done", ""
+            continue
         if kind not in ("user", "assistant"):
             continue
 
-        content = d.get("message", {}).get("content")
-        if isinstance(content, str):
-            text = content.strip()
-            # Skip slash-command echoes and interrupt markers.
-            if text and not text.startswith(("<", "[Request interrupted")):
-                yield kind, text
-        elif isinstance(content, list):
-            for block in content:
-                if block.get("type") == "text":
-                    text = block.get("text", "").strip()
-                    if text:
-                        yield kind, text
+        msg = d.get("message", {})
+        content = msg.get("content")
+        if kind == "user":
+            if any(d.get(f) for f in SYNTHETIC_USER_FLAGS):
+                continue
+            texts = [content] if isinstance(content, str) else [
+                b.get("text", "") for b in content or [] if b.get("type") == "text"
+            ]
+            for raw in texts:
+                text = user_text(raw)
+                if text:
+                    yield "user", text
+            continue
+
+        final = msg.get("stop_reason") in FINAL_STOP_REASONS
+        texts = [b.get("text", "").strip() for b in content or [] if b.get("type") == "text"]
+        texts = [x for x in texts if x]
+        if final:
+            for text in texts:
+                yield "assistant", text
+        else:
+            yield "working", "\n\n".join(texts)
+
+
+def normalize(text: str) -> str:
+    return " ".join(text.split())
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +175,11 @@ class AgentLink:
         self.pending: deque[str] = deque(maxlen=20)
         # (text, deadline) pairs driving the wrong-file detection above.
         self.awaiting: list[tuple[str, float]] = []
+        # Turn state: the last progress note (posted only if the turn ends
+        # without a final answer) and whether an answer was posted.
+        self.last_note = ""
+        self.answered = False
+        self.last_typing = 0.0
 
     def attach(self, session: str, cwd: str):
         """Point at a (possibly new) Claude session. Tailing starts at the end
@@ -150,11 +199,23 @@ class AgentLink:
         log.info("%s -> session %s (%s)", self.name, session, path)
 
     def note_injected(self, text: str):
+        text = normalize(text)
         self.pending.append(text)
         self.awaiting.append((text, time.monotonic() + self.ECHO_DEADLINE))
 
     def saw_echo(self, text: str):
         self.awaiting = [(t, d) for t, d in self.awaiting if t != text]
+
+    def take_echo(self, text: str) -> bool:
+        """True if `text` is a prompt we injected from Discord. Mid-turn
+        injections arrive wrapped in harness text, so containment counts."""
+        text = normalize(text)
+        mine = next((p for p in self.pending if p == text or p in text), None)
+        if mine is None:
+            return False
+        self.pending.remove(mine)
+        self.saw_echo(mine)
+        return True
 
     def rebind_if_lost(self) -> bool:
         """When an echo deadline expires, search recent transcripts for the
@@ -174,6 +235,9 @@ class AgentLink:
         for text in expired:
             # The transcript stores the text JSON-encoded; match either form.
             needles = [json.dumps(text)[1:-1].encode(), text.encode()]
+            # JSON-escaping also escapes newlines, so search on the first line.
+            first = text.splitlines()[0] if text else text
+            needles = [json.dumps(first)[1:-1].encode(), first.encode()]
             for path in recent[:15]:
                 raw = tail_bytes(path, 512 * 1024)
                 pos = -1
@@ -309,8 +373,7 @@ class Ratatoskr(discord.Client):
         link.note_injected(text)
         err = await asyncio.to_thread(herdr_prompt, link.name, text)
         if err:
-            link.pending.remove(text)
-            link.saw_echo(text)
+            link.take_echo(text)
             await message.channel.send(f"⚠️ could not reach `{link.name}`: {err}")
 
     # -- herdr -> Discord --------------------------------------------------- #
@@ -339,19 +402,35 @@ class Ratatoskr(discord.Client):
         if channel is None:
             return
 
+        working = False
         for role, text in turns_from_lines(lines):
             if role == "user":
+                link.last_note, link.answered = "", False
                 # Our own injected prompt echoing back - already on screen.
-                # Mid-turn injections arrive wrapped in harness text, so
-                # containment counts as a match too.
-                mine = next((p for p in link.pending if p == text or p in text), None)
-                if mine is not None:
-                    link.pending.remove(mine)
-                    link.saw_echo(mine)
+                if link.take_echo(text):
                     continue
-                await send_chunked(channel, text, prefix="💻 ")
-            else:
+                await send_chunked(channel, mirror(text))
+            elif role == "assistant":
+                link.answered = True
+                working = False
                 await send_chunked(channel, text)
+            elif role == "working":
+                working = True
+                if text:
+                    link.last_note = text
+            elif role == "done":
+                working = False
+                # A turn that ended without a final text (interrupted, or an
+                # unusual stop reason): post its last note so it isn't silent.
+                if not link.answered and link.last_note:
+                    await send_chunked(channel, link.last_note)
+                link.last_note, link.answered = "", False
+
+        # Show "typing..." while the agent works instead of its progress notes.
+        # Discord's indicator lasts about 10 s, so refresh it every 8.
+        if working and time.monotonic() - link.last_typing > 8:
+            link.last_typing = time.monotonic()
+            await channel.typing()
 
 
 def channel_name(agent: str) -> str:
@@ -376,10 +455,129 @@ def tail_bytes(path: Path, limit: int) -> bytes:
         return b""
 
 
-async def send_chunked(channel, text: str, prefix: str = ""):
-    body = prefix + text
-    for i in range(0, len(body), DISCORD_LIMIT):
-        await channel.send(body[i:i + DISCORD_LIMIT])
+# --------------------------------------------------------------------------- #
+# Discord formatting
+
+def mirror(text: str) -> str:
+    """A prompt typed at the computer: quoted, under a small grey label, so it
+    reads as the person's own words and not as the agent's."""
+    quoted = "\n".join("> " + line if line.strip() else ">" for line in text.splitlines())
+    return "-# desde el PC\n" + quoted
+
+
+TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _cells(row: str) -> list[str]:
+    row = row.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [c.strip() for c in row.split("|")]
+
+
+def _table_to_list(rows: list[str]) -> list[str]:
+    """Discord does not render Markdown tables. A two-column table becomes
+    "- **key**: value"; a wider one becomes "- **key**: header: value · ..."."""
+    header = _cells(rows[0])
+    out = []
+    for row in rows[2:]:
+        cells = _cells(row)
+        if not any(cells):
+            continue
+        key, rest = cells[0], cells[1:]
+        if len(header) <= 2:
+            value = " · ".join(c for c in rest if c)
+        else:
+            value = " · ".join(
+                f"{h}: {c}" if h else c
+                for h, c in zip(header[1:], rest) if c
+            )
+        if key:
+            key = key if key.startswith("**") else f"**{key}**"
+            out.append(f"- {key}: {value}" if value else f"- {key}")
+        else:
+            out.append(f"- {value}")
+    return out
+
+
+def discordify(text: str) -> str:
+    """Rewrite the Markdown Discord does not render: tables become lists,
+    horizontal rules disappear. Code blocks are left untouched."""
+    lines, out, in_code, i = text.splitlines(), [], False, 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if not in_code and "|" in line and i + 1 < len(lines) and TABLE_SEP_RE.match(lines[i + 1]):
+            j = i + 2
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                j += 1
+            out.extend(_table_to_list(lines[i:j]))
+            i = j
+            continue
+        if not in_code and re.fullmatch(r"\s*(-{3,}|\*{3,}|_{3,})\s*", line):
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def chunks(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
+    """Split on line boundaries, preferring blank lines, never mid-word unless
+    a single line is longer than the limit. A code block cut in two is closed
+    at the end of one message and reopened, same language, in the next."""
+    out: list[str] = []
+    cur: list[str] = []
+    size = 0
+    fence: str | None = None  # opening line of the code block we are in
+
+    def flush():
+        nonlocal cur, size
+        if not cur:
+            return
+        body = "\n".join(cur)
+        if fence is not None:
+            body += "\n```"
+        out.append(body)
+        cur = [fence] if fence is not None else []
+        size = len(fence) + 1 if fence is not None else 0
+
+    for line in text.splitlines():
+        while len(line) > limit - 10:  # a single huge line: hard split
+            head, line = line[: limit - 10], line[limit - 10:]
+            flush()
+            cur, size = cur + [head], size + len(head) + 1
+            flush()
+        reserve = 4 if fence is not None else 0
+        if size + len(line) + 1 + reserve > limit:
+            # Prefer to break at the last blank line of the current chunk.
+            blank = max((k for k, x in enumerate(cur) if not x.strip() and k > 0), default=-1)
+            if fence is None and blank > len(cur) // 2:
+                tail = cur[blank + 1:]
+                cur = cur[:blank]
+                flush()
+                cur, size = tail, sum(len(x) + 1 for x in tail)
+            else:
+                flush()
+        cur.append(line)
+        size += len(line) + 1
+        if line.lstrip().startswith("```"):
+            fence = None if fence is not None else line.strip()
+    if cur and any(x.strip() for x in cur) and cur != [fence]:
+        body = "\n".join(cur)
+        out.append(body)
+    return [c for c in out if c.strip() and c.strip() != "```"]
+
+
+async def send_chunked(channel, text: str):
+    for part in chunks(discordify(text)):
+        await channel.send(part)
 
 
 # --------------------------------------------------------------------------- #

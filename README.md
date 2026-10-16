@@ -24,9 +24,20 @@ reads replies from the transcript, where user and assistant turns are typed
 JSON rather than a screenful of box-drawing characters.
 
 Because the tailer sees *every* turn, messages typed at the computer are
-mirrored into the channel too (prefixed 💻), and prompts sent from Discord are
-deduplicated when they echo back. The channel ends up holding the complete
-history of that agent regardless of where each message was written.
+mirrored into the channel too (quoted, under a small "desde el PC" label), and
+prompts sent from Discord are deduplicated when they echo back. The channel ends
+up holding the complete history of that agent regardless of where each message
+was written.
+
+Only the answer reaches Discord. Text the agent writes between tool calls
+(progress notes, `stop_reason: tool_use`) stays in the terminal; while the
+agent works the channel shows "typing...". If a turn ends without a final
+answer (interrupted), its last note is posted so the turn is not silent. The
+compaction summary and other harness-generated "user" records are dropped.
+
+Discord does not render Markdown tables, so they are rewritten as lists, and
+long answers are split at paragraph boundaries, closing and reopening a code
+block if one is cut. Tests: `.venv/bin/python -m unittest -v`.
 
 Channel sync runs every 30s: a newly named herdr agent gets a channel under
 the `agents` category automatically; a vanished agent keeps its channel (it
