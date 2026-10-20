@@ -74,7 +74,27 @@ class Format(unittest.TestCase):
             self.assertTrue(p.strip().endswith("palabra"))
 
     def test_mirror_is_quoted(self):
-        self.assertEqual(r.mirror("a\n\nb"), "-# desde el PC\n> a\n>\n> b")
+        self.assertEqual(r.mirror("a\n\nb"), "-# typed at the computer\n> a\n>\n> b")
+
+    def test_mirror_label_is_configurable(self):
+        self.assertEqual(r.mirror("a", "desde el PC"), "-# desde el PC\n> a")
+
+
+class Config(unittest.TestCase):
+    def cfg(self, bridge=None):
+        cfg = {"discord": {"token": "x", "guild_id": 1, "owner_id": 2}}
+        if bridge is not None:
+            cfg["bridge"] = bridge
+        return cfg
+
+    def test_bridge_section_is_optional(self):
+        bot = r.Ratatoskr(self.cfg())
+        self.assertEqual(bot.category_name, "agents")
+        self.assertEqual(bot.mirror_label, r.MIRROR_LABEL)
+
+    def test_mirror_label_from_config(self):
+        bot = r.Ratatoskr(self.cfg({"mirror_label": "desde el PC"}))
+        self.assertEqual(bot.mirror_label, "desde el PC")
 
 
 if __name__ == "__main__":

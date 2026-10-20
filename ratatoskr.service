@@ -1,8 +1,13 @@
-# systemd user unit: symlink into ~/.config/systemd/user/ (install.sh does it)
+# systemd user unit template. install.sh renders it into
+# ~/.config/systemd/user/ratatoskr.service, replacing %h/Work/ratatoskr with
+# the path of the checkout it runs from. Do not edit the installed copy; edit
+# this file and re-run install.sh.
 [Unit]
 Description=Ratatoskr - Discord bridge to herdr agents
+# In a user manager network-online.target usually does not exist, so these two
+# lines rarely delay anything. What actually covers "no DNS yet at login" is
+# Restart=on-failure below: the first attempt fails, the second one connects.
 After=network-online.target
-# After= alone does not wait for the network; Wants= pulls in the wait.
 Wants=network-online.target
 
 [Service]

@@ -32,6 +32,9 @@ log = logging.getLogger("ratatoskr")
 CONFIG_PATH = Path.home() / ".config/ratatoskr/config.toml"
 PROJECTS_DIR = Path.home() / ".claude/projects"
 DISCORD_LIMIT = 1900  # hard limit is 2000; leave room for prefixes
+# Label above prompts typed at the computer and mirrored into Discord.
+# Overridable with [bridge] mirror_label in the config.
+MIRROR_LABEL = "typed at the computer"
 
 
 # --------------------------------------------------------------------------- #
@@ -233,9 +236,9 @@ class AgentLink:
         recent.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
         for text in expired:
-            # The transcript stores the text JSON-encoded; match either form.
-            needles = [json.dumps(text)[1:-1].encode(), text.encode()]
-            # JSON-escaping also escapes newlines, so search on the first line.
+            # The transcript stores the text JSON-encoded, so match either the
+            # encoded or the raw form. JSON-escaping also turns newlines into
+            # "\n", so search on the first line only.
             first = text.splitlines()[0] if text else text
             needles = [json.dumps(first)[1:-1].encode(), first.encode()]
             for path in recent[:15]:
@@ -292,10 +295,12 @@ class Ratatoskr(discord.Client):
         super().__init__(intents=intents)
 
         self.cfg = cfg
+        self.bridge: dict = cfg.get("bridge", {})
         self.guild_id: int = cfg["discord"]["guild_id"]
         self.owner_id: int = cfg["discord"]["owner_id"]
-        self.category_name: str = cfg["bridge"].get("category", "agents")
-        self.exclude: set[str] = set(cfg["bridge"].get("exclude", []))
+        self.category_name: str = self.bridge.get("category", "agents")
+        self.exclude: set[str] = set(self.bridge.get("exclude", []))
+        self.mirror_label: str = self.bridge.get("mirror_label", MIRROR_LABEL)
         self.links: dict[str, AgentLink] = {}  # agent name -> link
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -311,7 +316,7 @@ class Ratatoskr(discord.Client):
 
     async def sync_loop(self):
         await self.wait_until_ready()
-        interval = self.cfg["bridge"].get("sync_agents", 30.0)
+        interval = self.bridge.get("sync_agents", 30.0)
         while not self.is_closed():
             try:
                 await self.sync_agents()
@@ -380,7 +385,7 @@ class Ratatoskr(discord.Client):
 
     async def tail_loop(self):
         await self.wait_until_ready()
-        interval = self.cfg["bridge"].get("poll_transcripts", 2.0)
+        interval = self.bridge.get("poll_transcripts", 2.0)
         while not self.is_closed():
             for link in list(self.links.values()):
                 try:
@@ -409,7 +414,7 @@ class Ratatoskr(discord.Client):
                 # Our own injected prompt echoing back - already on screen.
                 if link.take_echo(text):
                     continue
-                await send_chunked(channel, mirror(text))
+                await send_chunked(channel, mirror(text, self.mirror_label))
             elif role == "assistant":
                 link.answered = True
                 working = False
@@ -458,11 +463,11 @@ def tail_bytes(path: Path, limit: int) -> bytes:
 # --------------------------------------------------------------------------- #
 # Discord formatting
 
-def mirror(text: str) -> str:
+def mirror(text: str, label: str = MIRROR_LABEL) -> str:
     """A prompt typed at the computer: quoted, under a small grey label, so it
     reads as the person's own words and not as the agent's."""
     quoted = "\n".join("> " + line if line.strip() else ">" for line in text.splitlines())
-    return "-# desde el PC\n" + quoted
+    return f"-# {label}\n" + quoted
 
 
 TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")

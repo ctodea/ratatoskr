@@ -1,12 +1,16 @@
-# Copy to ~/.config/ratatoskr/config.toml and fill in the three discord values.
+# Copy to ~/.config/ratatoskr/config.toml (install.sh does it) and fill in the
+# three [discord] values. Keep this file private: the token controls the bot.
 
 [discord]
-token = "BOT_TOKEN_FROM_DEVELOPER_PORTAL"
-guild_id = 0    # right-click your server -> Copy Server ID (enable Developer Mode)
-owner_id = 0    # right-click yourself   -> Copy User ID
+token = "PASTE_BOT_TOKEN_HERE"   # Developer Portal -> your app -> Bot -> Reset Token
+guild_id = 0    # right-click your server -> Copy Server ID (needs Developer Mode)
+owner_id = 0    # right-click your own name -> Copy User ID
 
 [bridge]
 category = "agents"        # Discord category the channels are created under
-sync_agents = 30.0         # seconds between herdr agent list scans
+sync_agents = 30.0         # seconds between `herdr agent list` scans
 poll_transcripts = 2.0     # seconds between transcript polls
 exclude = []               # agent names to leave unbridged, e.g. ["main"]
+# Small grey label above prompts typed at the computer and mirrored to Discord.
+# Default "typed at the computer"; the original author uses:
+# mirror_label = "desde el PC"

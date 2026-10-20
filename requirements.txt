@@ -1,0 +1,2 @@
+# Python 3.11 or newer (tomllib). Tested on 3.14.
+discord.py==2.7.1
